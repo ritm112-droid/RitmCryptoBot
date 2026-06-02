@@ -8,13 +8,17 @@ CHAT_ID = "6815963349"
 
 
 def send_telegram(text):
-    requests.post(
+
+    response = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         json={
             "chat_id": CHAT_ID,
             "text": text
         }
     )
+
+    print("TELEGRAM RESPONSE:")
+    print(response.text)
 
 
 @app.route("/")
