@@ -3,7 +3,7 @@ import requests
 
 app = Flask(__name__)
 
-BOT_TOKEN = "8775014015:AAHWE6UyW75wzvYHKzOOB18XzzySFFASWtc"
+BOT_TOKEN = "8775014015:AAHdDIZ6O868NMGrS3_8uHBnafwihe29LnA"
 CHAT_ID = "6815963349"
 
 
