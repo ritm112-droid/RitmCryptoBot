@@ -11,7 +11,6 @@ VOLUME_MULTIPLIER = 1.3
 MIN_24H_VOLUME = 5_000_000
 DUPLICATE_TIMEOUT = 1800
 
-session = HTTP(testnet=False)
 sent_signals = {}
 
 
