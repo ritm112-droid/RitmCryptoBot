@@ -1,6 +1,7 @@
 import requests
 import pandas as pd
 import time
+import json
 
 BOT_TOKEN = "8775014015:AAHdDIZ6O868NMGrS3_8uHBnafwihe29LnA"
 CHAT_ID = "6815963349"
@@ -10,8 +11,16 @@ KLINE_LIMIT = 250
 VOLUME_MULTIPLIER = 1.3
 MIN_24H_VOLUME = 5_000_000
 DUPLICATE_TIMEOUT = 1800
+SCAN_SLEEP = 60
 
 sent_signals = {}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 RitmCryptoBot/1.0",
+    "Accept": "application/json",
+}
+
+BASE_URL = "https://api.bybit.com"
 
 
 def send_telegram(text):
@@ -24,29 +33,57 @@ def send_telegram(text):
                 json={"chat_id": CHAT_ID, "text": text},
                 timeout=20
             )
-
-            print("Telegram response:", response.status_code, response.text)
+            print("Telegram:", response.status_code)
 
             if response.status_code == 200:
                 return True
 
         except Exception as e:
-            print(f"Ошибка Telegram, попытка {attempt + 1}: {e}")
+            print(f"Ошибка Telegram попытка {attempt + 1}: {e}")
             time.sleep(3)
 
     return False
 
 
 def bybit_get(endpoint, params=None):
-    url = f"https://api.bybit.com{endpoint}"
+    url = BASE_URL + endpoint
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=20
-    )
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers=HEADERS,
+                timeout=20
+            )
 
-    return response.json()
+            text = response.text.strip()
+
+            if response.status_code != 200:
+                print(f"Bybit HTTP {response.status_code}: {text[:200]}")
+                time.sleep(3)
+                continue
+
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                print("Bybit вернул не JSON:")
+                print(text[:300])
+                time.sleep(3)
+                continue
+
+            if data.get("retCode") not in (0, "0"):
+                print("Bybit API error:", data)
+                time.sleep(3)
+                continue
+
+            return data
+
+        except Exception as e:
+            print(f"Ошибка Bybit попытка {attempt + 1}: {e}")
+            time.sleep(3)
+
+    return None
 
 
 def get_symbols():
@@ -64,16 +101,16 @@ def get_symbols():
 
         data = bybit_get("/v5/market/instruments-info", params)
 
+        if not data:
+            print("Не удалось получить список монет Bybit")
+            return []
+
         result = data.get("result", {})
         items = result.get("list", [])
 
         for item in items:
-            symbol = item.get("symbol")
-            status = item.get("status")
-            quote_coin = item.get("quoteCoin")
-
-            if status == "Trading" and quote_coin == "USDT":
-                symbols.append(symbol)
+            if item.get("status") == "Trading" and item.get("quoteCoin") == "USDT":
+                symbols.append(item.get("symbol"))
 
         cursor = result.get("nextPageCursor")
 
@@ -91,17 +128,18 @@ def get_24h_volume_map():
         {"category": "linear"}
     )
 
+    if not data:
+        return volume_map
+
     items = data.get("result", {}).get("list", [])
 
     for item in items:
         symbol = item.get("symbol")
 
         try:
-            turnover_24h = float(item.get("turnover24h", 0))
+            volume_map[symbol] = float(item.get("turnover24h", 0))
         except Exception:
-            turnover_24h = 0
-
-        volume_map[symbol] = turnover_24h
+            volume_map[symbol] = 0
 
     return volume_map
 
@@ -120,6 +158,9 @@ def check_signal(symbol, volume_24h):
                 "limit": KLINE_LIMIT
             }
         )
+
+        if not data:
+            return
 
         candles = data.get("result", {}).get("list", [])
 
@@ -167,49 +208,41 @@ def check_signal(symbol, volume_24h):
         short_signal = sweep_high and volume_spike and bear_trend
 
         if long_signal:
-            signal_key = f"{symbol}_LONG"
-
-            if signal_key not in sent_signals:
-                message = f"""
-🚀 LONG
-
-Биржа: Bybit Futures
-Монета: {symbol}
-Цена: {round(last["close"], 6)}
-
-24h Volume: ${volume_24h:,.0f}
-
-EMA200: ✅
-Volume Spike: ✅
-Liquidity Sweep: ✅
-"""
-                print(message)
-                send_telegram(message)
-                sent_signals[signal_key] = time.time()
+            send_signal(symbol, "LONG", last["close"], volume_24h)
 
         if short_signal:
-            signal_key = f"{symbol}_SHORT"
-
-            if signal_key not in sent_signals:
-                message = f"""
-🔻 SHORT
-
-Биржа: Bybit Futures
-Монета: {symbol}
-Цена: {round(last["close"], 6)}
-
-24h Volume: ${volume_24h:,.0f}
-
-EMA200: ✅
-Volume Spike: ✅
-Liquidity Sweep: ✅
-"""
-                print(message)
-                send_telegram(message)
-                sent_signals[signal_key] = time.time()
+            send_signal(symbol, "SHORT", last["close"], volume_24h)
 
     except Exception as e:
         print(f"Ошибка {symbol}: {e}")
+
+
+def send_signal(symbol, side, price, volume_24h):
+    signal_key = f"{symbol}_{side}"
+
+    if signal_key in sent_signals:
+        return
+
+    emoji = "🚀" if side == "LONG" else "🔻"
+
+    message = f"""
+{emoji} {side}
+
+Биржа: Bybit Futures
+Монета: {symbol}
+Цена: {round(float(price), 6)}
+
+24h Volume: ${volume_24h:,.0f}
+
+EMA200: ✅
+Volume Spike: ✅
+Liquidity Sweep: ✅
+"""
+
+    print(message)
+    send_telegram(message)
+
+    sent_signals[signal_key] = time.time()
 
 
 def clean_old_signals():
@@ -224,15 +257,29 @@ def clean_old_signals():
         del sent_signals[key]
 
 
-symbols = get_symbols()
-print("Найдено Bybit USDT Futures:", len(symbols))
-
 while True:
+    print()
+    print("Получаю список монет Bybit...")
+
+    symbols = get_symbols()
+
+    if not symbols:
+        print("Список монет пустой. Повтор через 60 секунд.")
+        time.sleep(60)
+        continue
+
+    print("Найдено Bybit USDT Futures:", len(symbols))
+
     print()
     print("Начинаю новое сканирование Bybit...")
     print()
 
     volume_map = get_24h_volume_map()
+
+    if not volume_map:
+        print("Не удалось получить volume_map. Повтор через 60 секунд.")
+        time.sleep(60)
+        continue
 
     for symbol in symbols:
         check_signal(symbol, volume_map.get(symbol, 0))
@@ -244,4 +291,4 @@ while True:
     print("Ожидание 60 секунд...")
     print()
 
-    time.sleep(60)
+    time.sleep(SCAN_SLEEP)
