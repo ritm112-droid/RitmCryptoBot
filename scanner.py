@@ -1,30 +1,31 @@
-from binance.client import Client
+from pybit.unified_trading import HTTP
 import pandas as pd
 import requests
 import time
 
-# ================= TELEGRAM =================
-
 BOT_TOKEN = "8775014015:AAHdDIZ6O868NMGrS3_8uHBnafwihe29LnA"
 CHAT_ID = "6815963349"
+
+INTERVAL = "1"
+KLINE_LIMIT = 250
+VOLUME_MULTIPLIER = 1.3
+MIN_24H_VOLUME = 5_000_000
+DUPLICATE_TIMEOUT = 1800
+
+session = HTTP(testnet=False)
+sent_signals = {}
 
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text
-    }
-
     for attempt in range(3):
         try:
             response = requests.post(
                 url,
-                json=payload,
+                json={"chat_id": CHAT_ID, "text": text},
                 timeout=20
             )
-
             print("Telegram response:", response.status_code, response.text)
 
             if response.status_code == 200:
@@ -37,53 +38,95 @@ def send_telegram(text):
     return False
 
 
-# ================= BINANCE =================
+def get_symbols():
+    symbols = []
+    cursor = None
 
-client = Client()
+    while True:
+        params = {
+            "category": "linear",
+            "limit": 1000
+        }
 
-# Защита от дублей
-sent_signals = {}
+        if cursor:
+            params["cursor"] = cursor
 
-exchange_info = client.futures_exchange_info()
-tickers = client.futures_ticker()
+        data = session.get_instruments_info(**params)
+        result = data.get("result", {})
+        items = result.get("list", [])
 
-symbols = []
+        for item in items:
+            symbol = item.get("symbol")
+            status = item.get("status")
+            quote_coin = item.get("quoteCoin")
 
-for s in exchange_info["symbols"]:
-
-    if (
-        s["status"] == "TRADING"
-        and s["quoteAsset"] == "USDT"
-    ):
-
-        symbol = s["symbol"]
-
-        ticker = next(
-            (t for t in tickers if t["symbol"] == symbol),
-            None
-        )
-
-        if ticker:
-
-            quote_volume = float(ticker["quoteVolume"])
-
-            if quote_volume >= 5_000_000:
+            if status == "Trading" and quote_coin == "USDT":
                 symbols.append(symbol)
 
-def check_signal(symbol):
+        cursor = result.get("nextPageCursor")
+
+        if not cursor:
+            break
+
+    return symbols
+
+
+def get_24h_volume_map():
+    volume_map = {}
+
+    data = session.get_tickers(category="linear")
+    items = data.get("result", {}).get("list", [])
+
+    for item in items:
+        symbol = item.get("symbol")
+
+        try:
+            turnover_24h = float(item.get("turnover24h", 0))
+        except Exception:
+            turnover_24h = 0
+
+        volume_map[symbol] = turnover_24h
+
+    return volume_map
+
+
+def check_signal(symbol, volume_24h):
     try:
-        klines = client.futures_klines(
+        if volume_24h < MIN_24H_VOLUME:
+            return
+
+        data = session.get_kline(
+            category="linear",
             symbol=symbol,
-            interval="1m",
-            limit=250
+            interval=INTERVAL,
+            limit=KLINE_LIMIT
         )
 
-        df = pd.DataFrame(klines)
+        candles = data.get("result", {}).get("list", [])
 
-        df["close"] = df[4].astype(float)
-        df["high"] = df[2].astype(float)
-        df["low"] = df[3].astype(float)
-        df["volume"] = df[5].astype(float)
+        if len(candles) < 220:
+            return
+
+        df = pd.DataFrame(
+            candles,
+            columns=[
+                "startTime",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "turnover"
+            ]
+        )
+
+        df = df.iloc[::-1].reset_index(drop=True)
+
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
 
         df["ema200"] = df["close"].ewm(span=200).mean()
 
@@ -93,7 +136,7 @@ def check_signal(symbol):
         bear_trend = last["close"] < last["ema200"]
 
         avg_volume = df["volume"].tail(20).mean()
-        volume_spike = last["volume"] > avg_volume * 1.3
+        volume_spike = last["volume"] > avg_volume * VOLUME_MULTIPLIER
 
         highest_high = df["high"].tail(20).max()
         lowest_low = df["low"].tail(20).min()
@@ -111,8 +154,11 @@ def check_signal(symbol):
                 message = f"""
 🚀 LONG
 
+Биржа: Bybit Futures
 Монета: {symbol}
-Цена: {round(last['close'], 6)}
+Цена: {round(last["close"], 6)}
+
+24h Volume: ${volume_24h:,.0f}
 
 EMA200: ✅
 Volume Spike: ✅
@@ -129,8 +175,11 @@ Liquidity Sweep: ✅
                 message = f"""
 🔻 SHORT
 
+Биржа: Bybit Futures
 Монета: {symbol}
-Цена: {round(last['close'], 6)}
+Цена: {round(last["close"], 6)}
+
+24h Volume: ${volume_24h:,.0f}
 
 EMA200: ✅
 Volume Spike: ✅
@@ -144,23 +193,32 @@ Liquidity Sweep: ✅
         print(f"Ошибка {symbol}: {e}")
 
 
-while True:
-    print()
-    print("Начинаю новое сканирование...")
-    print()
-
-    for symbol in symbols:
-        check_signal(symbol)
-
+def clean_old_signals():
     now = time.time()
     expired = []
 
     for key, timestamp in sent_signals.items():
-        if now - timestamp > 1800:
+        if now - timestamp > DUPLICATE_TIMEOUT:
             expired.append(key)
 
     for key in expired:
         del sent_signals[key]
+
+
+symbols = get_symbols()
+print("Найдено Bybit USDT Futures:", len(symbols))
+
+while True:
+    print()
+    print("Начинаю новое сканирование Bybit...")
+    print()
+
+    volume_map = get_24h_volume_map()
+
+    for symbol in symbols:
+        check_signal(symbol, volume_map.get(symbol, 0))
+
+    clean_old_signals()
 
     print()
     print("Сканирование завершено")
