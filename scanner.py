@@ -1,5 +1,5 @@
-import pandas as pd
 import requests
+import pandas as pd
 import time
 
 BOT_TOKEN = "8775014015:AAHdDIZ6O868NMGrS3_8uHBnafwihe29LnA"
@@ -24,6 +24,7 @@ def send_telegram(text):
                 json={"chat_id": CHAT_ID, "text": text},
                 timeout=20
             )
+
             print("Telegram response:", response.status_code, response.text)
 
             if response.status_code == 200:
@@ -34,6 +35,18 @@ def send_telegram(text):
             time.sleep(3)
 
     return False
+
+
+def bybit_get(endpoint, params=None):
+    url = f"https://api.bybit.com{endpoint}"
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=20
+    )
+
+    return response.json()
 
 
 def get_symbols():
@@ -49,7 +62,8 @@ def get_symbols():
         if cursor:
             params["cursor"] = cursor
 
-        data = session.get_instruments_info(**params)
+        data = bybit_get("/v5/market/instruments-info", params)
+
         result = data.get("result", {})
         items = result.get("list", [])
 
@@ -72,7 +86,11 @@ def get_symbols():
 def get_24h_volume_map():
     volume_map = {}
 
-    data = session.get_tickers(category="linear")
+    data = bybit_get(
+        "/v5/market/tickers",
+        {"category": "linear"}
+    )
+
     items = data.get("result", {}).get("list", [])
 
     for item in items:
@@ -93,11 +111,14 @@ def check_signal(symbol, volume_24h):
         if volume_24h < MIN_24H_VOLUME:
             return
 
-        data = session.get_kline(
-            category="linear",
-            symbol=symbol,
-            interval=INTERVAL,
-            limit=KLINE_LIMIT
+        data = bybit_get(
+            "/v5/market/kline",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": INTERVAL,
+                "limit": KLINE_LIMIT
+            }
         )
 
         candles = data.get("result", {}).get("list", [])
@@ -193,11 +214,11 @@ Liquidity Sweep: ✅
 
 def clean_old_signals():
     now = time.time()
-    expired = []
 
-    for key, timestamp in sent_signals.items():
-        if now - timestamp > DUPLICATE_TIMEOUT:
-            expired.append(key)
+    expired = [
+        key for key, timestamp in sent_signals.items()
+        if now - timestamp > DUPLICATE_TIMEOUT
+    ]
 
     for key in expired:
         del sent_signals[key]
